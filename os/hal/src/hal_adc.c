@@ -188,24 +188,43 @@ void adcStartConversion(ADCDriver *adcp,
  *
  * @iclass
  */
-void adcStartConversionI(ADCDriver *adcp,
-                         const ADCConversionGroup *grpp,
-                         adcsample_t *samples,
-                         size_t depth) {
 
-  osalDbgCheckClassI();
-  osalDbgCheck((adcp != NULL) && (grpp != NULL) && (samples != NULL) &&
-               (depth > 0U) && ((depth == 1U) || ((depth & 1U) == 0U)));
-  osalDbgAssert((adcp->state == ADC_READY) ||
-                (adcp->state == ADC_ERROR),
-                "not ready");
+	void adcStartConversionI(ADCDriver *adcp,
+							const ADCConversionGroup *grpp,
+							adcsample_t *samples,
+							size_t depth) {
 
-  adcp->samples  = samples;
-  adcp->depth    = depth;
-  adcp->grpp     = grpp;
-  adcp->state    = ADC_ACTIVE;
-  adc_lld_start_conversion(adcp);
-}
+	osalDbgCheckClassI();
+	osalDbgCheck((adcp != NULL) && (grpp != NULL) && (samples != NULL) &&
+				(depth > 0U) && ((depth == 1U) || ((depth & 1U) == 0U)));
+
+				
+				
+				// TODO: remove this once we have a proper recovery mechanism
+				// See https://github.com/epicEFI/epicefi_fw/issues/412
+	/* Recovery from invalid states (e.g., after flash write interruption) */
+	if ((adcp->state != ADC_READY) && (adcp->state != ADC_ERROR)) {
+		/* If ADC is stuck in ACTIVE state (e.g., interrupted by flash write),
+		* try to recover by stopping the stuck conversion */
+		if (adcp->state == ADC_ACTIVE) {
+		adc_lld_stop_conversion(adcp);
+		adcp->grpp  = NULL;
+		adcp->state = ADC_READY;
+		_adc_reset_i(adcp);
+		} else {
+		/* For other invalid states, assert as before */
+		osalDbgAssert((adcp->state == ADC_READY) ||
+						(adcp->state == ADC_ERROR),
+						"not ready");
+		}
+	}
+
+	adcp->samples  = samples;
+	adcp->depth    = depth;
+	adcp->grpp     = grpp;
+	adcp->state    = ADC_ACTIVE;
+	adc_lld_start_conversion(adcp);
+	}
 
 /**
  * @brief   Stops an ongoing conversion.
