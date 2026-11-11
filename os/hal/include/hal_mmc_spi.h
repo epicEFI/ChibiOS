@@ -31,10 +31,22 @@
 /* Driver constants.                                                         */
 /*===========================================================================*/
 
+/* Overridable per board: with no card on the bus each of these iterations costs a
+ * stuck-frame timeout (SPIv3 aborts after SPI_LLD_WAIT_COMPLETE_TIMEOUT_MS), so the
+ * defaults turn a card-less probe into minutes of SPI traffic. Boards with a card-less
+ * bench can shrink the ladder without touching every other MMC_SPI board. */
+#if !defined(MMC_CMD0_RETRY) || defined(__DOXYGEN__)
 #define MMC_CMD0_RETRY                  10U
+#endif
+#if !defined(MMC_CMD1_RETRY) || defined(__DOXYGEN__)
 #define MMC_CMD1_RETRY                  100U
+#endif
+#if !defined(MMC_ACMD41_RETRY) || defined(__DOXYGEN__)
 #define MMC_ACMD41_RETRY                100U
+#endif
+#if !defined(MMC_WAIT_DATA) || defined(__DOXYGEN__)
 #define MMC_WAIT_DATA                   10000U
+#endif
 
 /**
  * @brief   Size of the buffer to be supplied to the driver.
