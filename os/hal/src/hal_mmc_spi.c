@@ -31,6 +31,18 @@
 
 #if (HAL_USE_MMC_SPI == TRUE) || defined(__DOXYGEN__)
 
+/*
+ * Optional stage hook: the application may override this to publish how far the
+ * connect sequence got (a card-less probe that parks inside this file is otherwise
+ * invisible - no console, no return). Weak and empty by default, so every other
+ * board pays nothing.
+ *
+ * Marks: 10 start, 11 clocks sent, 12 CMD0 attempt sent, 13 R1 received,
+ *        14 init loop sent, 15 failed, 16 connected, 17 before spiStart,
+ *        18 after spiStart (before the 16 dummy clocks).
+ */
+__attribute__((weak)) void mmcProbeMark(uint8_t stage) { (void)stage; }
+
 #define MMC_USE_POLLED_EXCHANGE TRUE
 
 // MMC_USE_POLLED_EXCHANGE is an optimzation that uses the synchronous, non-DMA
@@ -623,20 +635,26 @@ bool mmcConnect(MMCDriver *mmcp) {
                 "invalid state");
 
   /* Connection procedure in progress.*/
+  mmcProbeMark(10);
   mmcp->state = BLK_CONNECTING;
   mmcp->block_addresses = false;
 
   /* Slow clock mode and 128 clock pulses.*/
+  mmcProbeMark(17);
   spiStart(mmcp->config->spip, mmcp->config->lscfg);
+  mmcProbeMark(18);
   spiIgnoreSmall(mmcp->config->spip, 16);
+  mmcProbeMark(11);
 
   /* SPI mode selection.*/
   i = 0U;
   while (true) {
+    mmcProbeMark(12);
     if ((mmc_send_command_R1(mmcp, MMCSD_CMD_GO_IDLE_STATE, 0, &r1) == HAL_SUCCESS) &&
         (r1 == 0x01U)) {
       break;
     }
+    mmcProbeMark(13);
 
     if (++i >= MMC_CMD0_RETRY) {
       goto failed;
@@ -698,6 +716,7 @@ bool mmcConnect(MMCDriver *mmcp) {
     osalThreadSleepMilliseconds(10);
   }
 
+  mmcProbeMark(14);
   /* Initialization complete, full speed.*/
   spiStart(mmcp->config->spip, mmcp->config->hscfg);
 
@@ -725,11 +744,13 @@ bool mmcConnect(MMCDriver *mmcp) {
   }
 
   mmcp->state = BLK_READY;
+  mmcProbeMark(16);
 
   return HAL_SUCCESS;
 
   /* Connection failed, state reset to BLK_ACTIVE.*/
 failed:
+  mmcProbeMark(15);
   spiStop(mmcp->config->spip);
 
   mmcp->state = BLK_ACTIVE;
