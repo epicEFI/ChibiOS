@@ -68,6 +68,20 @@ SPIDriver SPID6;
 /* Driver local variables and types.                                         */
 /*===========================================================================*/
 
+/*
+ * Bound for the polled-transfer wait loops below. They used to be plain
+ * `while (flag)` spins: with a peripheral that stopped answering (a dead or absent
+ * SD card on SPI2, measured on epicECUv1 2026-11-11) CSTART/RXP never assert, the
+ * calling thread spins at full CPU and never reaches its own retry or failure path -
+ * the SD probe then parks in the 16-clock burst inside mmcConnect(). A raw iteration
+ * budget, not TIME_MS2I: this code is reachable from I-class contexts where the
+ * system tick is masked, so a time-based bound never trips.
+ * ~200k register reads is a few ms of CPU.
+ */
+#define SPI_V2_WAIT_LOOP_BUDGET 200000U
+/* "No response": the SD bus idle level for the frame width in use. */
+#define SPI_V2_IDLE_FRAME(dsize) ((dsize) <= 8U ? 0xFFU : ((dsize) <= 16U ? 0xFFFFU : 0xFFFFFFFFU))
+
 /*===========================================================================*/
 /* Driver local functions.                                                   */
 /*===========================================================================*/
@@ -102,7 +116,13 @@ static void spi_lld_suspend(SPIDriver *spip) {
 
   if (!spip->config->slave) {
     spip->spi->CR1 |= SPI_CR1_CSUSP;
+    uint32_t budget = SPI_V2_WAIT_LOOP_BUDGET;
     while ((spip->spi->CR1 & SPI_CR1_CSTART) != 0U) {
+      if (--budget == 0U) {
+        /* Peripheral never released CSTART: leave the flags cleared and let the caller
+         * treat this frame as failed instead of parking here forever. */
+        break;
+      }
     }
   }
   spip->spi->IFCR = 0xFFFFFFFF;
@@ -1343,12 +1363,17 @@ msg_t spi_lld_stop_transfer(SPIDriver *spip, size_t *sizep) {
 uint32_t spi_lld_polled_exchange(SPIDriver *spip, uint32_t frame) {
   uint32_t dsize = (spip->spi->CFG1 & SPI_CFG1_DSIZE_Msk) + 1U;
   uint32_t rxframe;
+  uint32_t budget = SPI_V2_WAIT_LOOP_BUDGET;
 
   spi_lld_resume(spip);
 
   /* wait for room in TX FIFO.*/
-  while ((spip->spi->SR & SPI_SR_TXP) == 0U)
-    ;
+  while ((spip->spi->SR & SPI_SR_TXP) == 0U) {
+    if (--budget == 0U) {
+      spi_lld_suspend(spip);
+      return SPI_V2_IDLE_FRAME(dsize);
+    }
+  }
 
   /* Data register must be accessed with the appropriate data size.
      Byte size access (uint8_t *) for transactions that are <= 8-bit etc.*/
@@ -1357,8 +1382,12 @@ uint32_t spi_lld_polled_exchange(SPIDriver *spip, uint32_t frame) {
     volatile uint8_t *txdrp8 = (volatile uint8_t *)&spip->spi->TXDR;
     volatile uint8_t *rxdrp8 = (volatile uint8_t *)&spip->spi->RXDR;
     *txdrp8 = (uint8_t)frame;
-    while ((spip->spi->SR & SPI_SR_RXP) == 0U)
-      ;
+    while ((spip->spi->SR & SPI_SR_RXP) == 0U) {
+      if (--budget == 0U) {
+        spi_lld_suspend(spip);
+        return 0xFFU;
+      }
+    }
     rxframe = (uint32_t)*rxdrp8;
   }
   else if (dsize <= 16U) {
@@ -1366,15 +1395,23 @@ uint32_t spi_lld_polled_exchange(SPIDriver *spip, uint32_t frame) {
     volatile uint16_t *txdrp16 = (volatile uint16_t *)&spip->spi->TXDR;
     volatile uint16_t *rxdrp16 = (volatile uint16_t *)&spip->spi->RXDR;
     *txdrp16 = (uint16_t)frame;
-    while ((spip->spi->SR & SPI_SR_RXP) == 0U)
-      ;
+    while ((spip->spi->SR & SPI_SR_RXP) == 0U) {
+      if (--budget == 0U) {
+        spi_lld_suspend(spip);
+        return 0xFFFFU;
+      }
+    }
     rxframe = (uint32_t)*rxdrp16;
   }
   else {
     /* Frame width is between 16 and 32 bits.*/
     spip->spi->TXDR = frame;
-    while ((spip->spi->SR & SPI_SR_RXP) == 0U)
-      ;
+    while ((spip->spi->SR & SPI_SR_RXP) == 0U) {
+      if (--budget == 0U) {
+        spi_lld_suspend(spip);
+        return 0xFFFFFFFFU;
+      }
+    }
     rxframe = spip->spi->RXDR;
   }
 
