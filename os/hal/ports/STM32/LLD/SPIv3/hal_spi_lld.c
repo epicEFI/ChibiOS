@@ -112,9 +112,11 @@ static void spi_lld_wait_complete(SPIDriver *spip) {
         dmaStreamDisable(spip->rx.dma);
       }
 #endif
-      /* Aborting a transfer on SPIv3 requires dropping SPE, not just CSUSP.*/
-      spip->spi->CR1 &= ~SPI_CR1_SPE;
-      spip->spi->CR1 |= SPI_CR1_SPE;
+      /* Do NOT bounce SPE here: on SPIv3 the peripheral must not be disabled with
+       * CFG1 loaded, and a stuck bus is exactly when a half-configured stop would make
+       * every *subsequent* frame time out too (observed on epicECUv1 2026-11-11, where
+       * that turned a card-less probe into a permanent timeout loop). The caller's retry
+       * ladder bounds the damage; a real recovery is spi_lld_stop() + spi_lld_start(). */
       break;
     }
   }
@@ -1190,12 +1192,11 @@ uint32_t spi_lld_polled_exchange(SPIDriver *spip, uint32_t frame) {
   return rxframe;
 
 timeout:
-  /* The peripheral stopped answering: abort the frame (SPIv3 needs SPE dropped to
-   * release CSTART) and report the idle level for this frame width, so the caller's
-   * retry/failure path runs instead of the thread spinning here forever. */
+  /* The peripheral stopped answering: suspend the frame and report the idle level for
+   * this frame width, so the caller's retry/failure path runs instead of the thread
+   * spinning here forever. SPE is deliberately left alone - see the note in
+   * spi_lld_wait_complete() on why a half-configured stop would poison every later frame. */
   spip->spi->CR1 |= SPI_CR1_CSUSP;
-  spip->spi->CR1 &= ~SPI_CR1_SPE;
-  spip->spi->CR1 |= SPI_CR1_SPE;
   spip->spi->IFCR = 0xFFFFFFFF;
   if (dsize <= 8U) {
     return 0xFFU;
