@@ -75,9 +75,45 @@ static uint32_t dummyrx;
 /* Driver local functions.                                                   */
 /*===========================================================================*/
 
+/* Upper bound for a transfer to release CSTART before it is aborted as stuck.
+ * A 512-byte SD block at the slow identification clock (375 kHz) is ~11 ms, so 100 ms
+ * cannot fire on a healthy transfer while still ending a dead-card hang promptly. */
+#define SPI_LLD_WAIT_COMPLETE_TIMEOUT_MS 100
+
+/*
+ * Waits until the previous transfer released CSTART. Bounded on purpose: a peripheral
+ * that stopped answering (dead SD card, absent card with a floating MISO, a killed DMA
+ * stream) leaves CSTART set forever, and the unbounded version parked the calling thread
+ * in this loop at full CPU - measured on epicECUv1 2026-11-11, where the SD thread
+ * (NORMALPRIO-1, never sleeping) starved the storage manager thread, so no burn ever
+ * ran and flashWritePending latched with the whole reboot/DFU gate behind it.
+ * On timeout the stuck transfer is aborted (suspend, stop the armed DMA streams,
+ * bounce SPE) so the peripheral is usable again and the caller's own retry/failure
+ * logic becomes reachable.
+ */
 static void spi_lld_wait_complete(SPIDriver *spip) {
+  systime_t start = chVTGetSystemTimeX();
 
   while ((spip->spi->CR1 & SPI_CR1_CSTART) != 0) {
+    if (chVTTimeElapsedSinceX(start) > TIME_MS2I(SPI_LLD_WAIT_COMPLETE_TIMEOUT_MS)) {
+      spip->spi->CR1 |= SPI_CR1_CSUSP;
+#if defined(STM32_SPI_BDMA_REQUIRED)
+      if (spip->is_bdma) {
+        bdmaStreamDisable(spip->tx.bdma);
+        bdmaStreamDisable(spip->rx.bdma);
+      } else
+#endif
+#if defined(STM32_SPI_DMA_REQUIRED)
+      {
+        dmaStreamDisable(spip->tx.dma);
+        dmaStreamDisable(spip->rx.dma);
+      }
+#endif
+      /* Aborting a transfer on SPIv3 requires dropping SPE, not just CSUSP.*/
+      spip->spi->CR1 &= ~SPI_CR1_SPE;
+      spip->spi->CR1 |= SPI_CR1_SPE;
+      break;
+    }
   }
   spip->spi->IFCR = 0xFFFFFFFF;
 }
@@ -1095,14 +1131,19 @@ void spi_lld_abort(SPIDriver *spip) {
 uint32_t spi_lld_polled_exchange(SPIDriver *spip, uint32_t frame) {
   uint32_t dsize = (spip->spi->CFG1 & SPI_CFG1_DSIZE_Msk) + 1U;
   uint32_t rxframe;
+  systime_t start;
 
   spi_lld_wait_complete(spip);
 
   spip->spi->CR1 |= SPI_CR1_CSTART;
+  start = chVTGetSystemTimeX();
 
   /* wait for room in TX FIFO.*/
-  while ((spip->spi->SR & SPI_SR_TXP) == 0U)
-    ;
+  while ((spip->spi->SR & SPI_SR_TXP) == 0U) {
+    if (chVTTimeElapsedSinceX(start) > TIME_MS2I(SPI_LLD_WAIT_COMPLETE_TIMEOUT_MS)) {
+      goto timeout;
+    }
+  }
 
   /* Data register must be accessed with the appropriate data size.
      Byte size access (uint8_t *) for transactions that are <= 8-bit etc.*/
@@ -1111,8 +1152,11 @@ uint32_t spi_lld_polled_exchange(SPIDriver *spip, uint32_t frame) {
     volatile uint8_t *txdrp8 = (volatile uint8_t *)&spip->spi->TXDR;
     volatile uint8_t *rxdrp8 = (volatile uint8_t *)&spip->spi->RXDR;
     *txdrp8 = (uint8_t)frame;
-    while ((spip->spi->SR & SPI_SR_RXP) == 0U)
-      ;
+    while ((spip->spi->SR & SPI_SR_RXP) == 0U) {
+      if (chVTTimeElapsedSinceX(start) > TIME_MS2I(SPI_LLD_WAIT_COMPLETE_TIMEOUT_MS)) {
+        goto timeout;
+      }
+    }
     rxframe = (uint32_t)*rxdrp8;
   }
   else if (dsize <= 16U) {
@@ -1120,21 +1164,43 @@ uint32_t spi_lld_polled_exchange(SPIDriver *spip, uint32_t frame) {
     volatile uint16_t *txdrp16 = (volatile uint16_t *)&spip->spi->TXDR;
     volatile uint16_t *rxdrp16 = (volatile uint16_t *)&spip->spi->RXDR;
     *txdrp16 = (uint16_t)frame;
-    while ((spip->spi->SR & SPI_SR_RXP) == 0U)
-      ;
+    while ((spip->spi->SR & SPI_SR_RXP) == 0U) {
+      if (chVTTimeElapsedSinceX(start) > TIME_MS2I(SPI_LLD_WAIT_COMPLETE_TIMEOUT_MS)) {
+        goto timeout;
+      }
+    }
     rxframe = (uint32_t)*rxdrp16;
   }
   else {
     /* Frame width is between 16 and 32 bits.*/
     spip->spi->TXDR = frame;
-    while ((spip->spi->SR & SPI_SR_RXP) == 0U)
-      ;
+    while ((spip->spi->SR & SPI_SR_RXP) == 0U) {
+      if (chVTTimeElapsedSinceX(start) > TIME_MS2I(SPI_LLD_WAIT_COMPLETE_TIMEOUT_MS)) {
+        goto timeout;
+      }
+    }
     rxframe = spip->spi->RXDR;
   }
 
   spip->spi->CR1 |= SPI_CR1_CSUSP;
 
   return rxframe;
+
+timeout:
+  /* The peripheral stopped answering: abort the frame (SPIv3 needs SPE dropped to
+   * release CSTART) and report the idle level for this frame width, so the caller's
+   * retry/failure path runs instead of the thread spinning here forever. */
+  spip->spi->CR1 |= SPI_CR1_CSUSP;
+  spip->spi->CR1 &= ~SPI_CR1_SPE;
+  spip->spi->CR1 |= SPI_CR1_SPE;
+  spip->spi->IFCR = 0xFFFFFFFF;
+  if (dsize <= 8U) {
+    return 0xFFU;
+  }
+  if (dsize <= 16U) {
+    return 0xFFFFU;
+  }
+  return 0xFFFFFFFFU;
 }
 
 #endif /* HAL_USE_SPI */
