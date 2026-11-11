@@ -75,10 +75,13 @@ static uint32_t dummyrx;
 /* Driver local functions.                                                   */
 /*===========================================================================*/
 
-/* Upper bound for a transfer to release CSTART before it is aborted as stuck.
- * A 512-byte SD block at the slow identification clock (375 kHz) is ~11 ms, so 100 ms
- * cannot fire on a healthy transfer while still ending a dead-card hang promptly. */
-#define SPI_LLD_WAIT_COMPLETE_TIMEOUT_MS 100
+/* Upper bound for one polled frame to complete before it is aborted as stuck.
+ * A real frame is bytes-scale: one SD byte at the 375 kHz identification clock is ~21 us,
+ * and wait_complete() only guards the *previous* transfer (CSTART clear on entry), so
+ * 2 ms is ~100x margin. Keep it small: the MMC driver's own retry ladders call this per
+ * byte (MMC_IDLE_TIMEOUT_MS = 1000 iterations), so every ms here is multiplied into
+ * minutes of a card-less probe - measured on epicECUv1 2026-11-11. */
+#define SPI_LLD_WAIT_COMPLETE_TIMEOUT_MS 2
 
 /*
  * Waits until the previous transfer released CSTART. Bounded on purpose: a peripheral
